@@ -22,9 +22,10 @@ import keyboard
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
-APP_NAME = "NyaClicker"
-VERSION  = "1.0.0"
-HOTKEY   = "f8"
+APP_NAME    = "NyaClicker"
+VERSION     = "1.0.0"
+HOTKEY      = "f8"
+HOTKEY_REC  = "f9"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -46,8 +47,8 @@ class Action:
         self.y            = 0
         self.x2           = 100
         self.y2           = 100
-        self.delay_ms     = 50      # pause BEFORE this action
-        self.hold_ms      = 200     # duration of hold / swipe
+        self.delay_ms     = 50
+        self.hold_ms      = 200
         self.button       = "left"
         self.repeat       = 1
         self.enabled      = True
@@ -77,6 +78,168 @@ class Action:
         rep = f"  ×{self.repeat}" if self.repeat > 1 else ""
         return f"  {en} {idx:2}. {ico} {self.action_type:<14}  {s}{rep}"
 
+    def rec_label(self, idx: int) -> str:
+        """Compact label used in the recording list (no enabled flag)."""
+        icons = {
+            "Клик": "🖱 ", "Двойной клик": "🖱🖱", "ПКМ": "🖱➡",
+            "Удержание": "⏱ ", "Свайп": "↔ ",
+        }
+        ico = icons.get(self.action_type, "● ")
+        if self.action_type == "Свайп":
+            s = f"({self.x},{self.y}) → ({self.x2},{self.y2})  dur:{self.hold_ms}ms"
+        elif self.action_type == "Удержание":
+            s = f"({self.x},{self.y})  hold:{self.hold_ms}ms"
+        else:
+            s = f"({self.x},{self.y})"
+        return f"  {idx:3}. {ico} {self.action_type:<14}  {s}  +{self.delay_ms}ms"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Mouse Recorder
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Recorder:
+    """Listens for real mouse events and converts them into Action objects."""
+
+    DRAG_THRESHOLD  = 8    # pixels of movement = swipe, not click
+    HOLD_THRESHOLD  = 250  # ms held = Удержание
+    DC_THRESHOLD    = 350  # ms between two clicks at same spot = double-click
+
+    def __init__(self, on_action, on_stopped):
+        """
+        on_action(action: Action) — called on each captured action (from bg thread).
+        on_stopped()              — called when recording stops.
+        """
+        self._on_action  = on_action
+        self._on_stopped = on_stopped
+        self._listener   = None
+        self._lock       = threading.Lock()
+        self.recorded: list[Action] = []
+
+        self._last_t: float    = 0.0
+        self._press_t: float   = 0.0
+        self._press_pos        = (0, 0)
+        self._press_btn: str   = "left"
+
+        # Double-click detection
+        self._pending: Action | None  = None
+        self._pending_timer           = None
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def start(self):
+        from pynput import mouse as pym
+
+        self.recorded   = []
+        self._last_t    = time.perf_counter()
+        self._press_t   = 0.0
+        self._pending   = None
+
+        def on_click(x, y, button, pressed):
+            t   = time.perf_counter()
+            btn = button.name if hasattr(button, "name") else str(button)
+
+            if pressed:
+                self._press_t   = t
+                self._press_pos = (int(x), int(y))
+                self._press_btn = btn
+            else:
+                self._handle_release(int(x), int(y), t)
+
+        self._listener = pym.Listener(on_click=on_click)
+        self._listener.start()
+
+    def stop(self):
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
+        # flush any pending double-click timer
+        if self._pending_timer:
+            self._pending_timer.cancel()
+            self._pending_timer = None
+        if self._pending:
+            self._commit(self._pending)
+            self._pending = None
+        self._on_stopped()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _handle_release(self, rx: int, ry: int, t: float):
+        if self._press_t == 0.0:
+            return
+
+        duration_ms = int((t - self._press_t) * 1000)
+        delay_ms    = max(0, int((self._press_t - self._last_t) * 1000))
+        self._last_t = t
+        self._press_t = 0.0
+
+        dx = abs(rx - self._press_pos[0])
+        dy = abs(ry - self._press_pos[1])
+
+        a = Action()
+        a.delay_ms = delay_ms
+        a.button   = self._press_btn
+        a.x        = self._press_pos[0]
+        a.y        = self._press_pos[1]
+
+        if dx > self.DRAG_THRESHOLD or dy > self.DRAG_THRESHOLD:
+            # ── Swipe ──────────────────────────────────────────────────────
+            a.action_type = "Свайп"
+            a.x2          = rx
+            a.y2          = ry
+            a.hold_ms     = duration_ms
+            self._flush_pending()
+            self._commit(a)
+
+        elif duration_ms >= self.HOLD_THRESHOLD:
+            # ── Hold ───────────────────────────────────────────────────────
+            a.action_type = "Удержание"
+            a.hold_ms     = duration_ms
+            self._flush_pending()
+            self._commit(a)
+
+        else:
+            # ── Click (maybe double-click) ─────────────────────────────────
+            a.action_type = "Клик" if self._press_btn == "left" else "ПКМ"
+
+            if (self._pending is not None
+                    and self._pending.action_type == "Клик"
+                    and self._press_btn == "left"
+                    and abs(a.x - self._pending.x) < 12
+                    and abs(a.y - self._pending.y) < 12
+                    and delay_ms < self.DC_THRESHOLD):
+                # Merge into double-click
+                if self._pending_timer:
+                    self._pending_timer.cancel()
+                    self._pending_timer = None
+                self._pending.action_type = "Двойной клик"
+                self._commit(self._pending)
+                self._pending = None
+            else:
+                self._flush_pending()
+                if self._press_btn == "left":
+                    # Hold pending briefly to detect possible double-click
+                    self._pending = a
+                    self._pending_timer = threading.Timer(
+                        self.DC_THRESHOLD / 1000, self._flush_pending
+                    )
+                    self._pending_timer.start()
+                else:
+                    self._commit(a)
+
+    def _flush_pending(self):
+        with self._lock:
+            if self._pending_timer:
+                self._pending_timer.cancel()
+                self._pending_timer = None
+            if self._pending:
+                self._commit(self._pending)
+                self._pending = None
+
+    def _commit(self, a: Action):
+        self.recorded.append(a)
+        self._on_action(a)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Action edit dialog
@@ -95,7 +258,6 @@ class ActionDialog(ctk.CTkToplevel):
         self.result: Action = None
         src = action or Action()
 
-        # ── variables ──────────────────────────────────────────────────────────
         self.tv  = tk.StringVar(value=src.action_type)
         self.xv  = tk.StringVar(value=str(src.x))
         self.yv  = tk.StringVar(value=str(src.y))
@@ -110,25 +272,19 @@ class ActionDialog(ctk.CTkToplevel):
 
         self._build()
 
-    # ── layout ─────────────────────────────────────────────────────────────────
-
     def _build(self):
-        # Type + enabled
         s = self._section("Тип действия")
         row = ctk.CTkFrame(s, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkOptionMenu(row, values=Action.TYPES, variable=self.tv, width=210).pack(side="left")
         ctk.CTkCheckBox(row, text=" Включено", variable=self.ev).pack(side="left", padx=20)
 
-        # Start coords
         s = self._section("Начальная точка  (X, Y)")
         self._coord_row(s, self.xv, self.yv, self._cap_start)
 
-        # Swipe end coords
         s = self._section("Конечная точка  (X2, Y2)  ← только для Свайп")
         self._coord_row(s, self.x2v, self.y2v, self._cap_end)
 
-        # Timing
         s = self._section("Тайминг")
         trow = ctk.CTkFrame(s, fg_color="transparent")
         trow.pack(fill="x", padx=10, pady=(0, 6))
@@ -147,7 +303,6 @@ class ActionDialog(ctk.CTkToplevel):
         ctk.CTkLabel(brow, text="Кнопка мыши:").pack(side="left")
         ctk.CTkOptionMenu(brow, values=Action.BUTTONS, variable=self.bv, width=130).pack(side="left", padx=8)
 
-        # Buttons
         bf = ctk.CTkFrame(self, fg_color="transparent")
         bf.pack(pady=(8, 14))
         ctk.CTkButton(
@@ -180,41 +335,30 @@ class ActionDialog(ctk.CTkToplevel):
             fg_color="#e94560", hover_color="#c0392b", command=cap_fn
         ).pack(side="left", padx=6)
 
-    # ── capture ─────────────────────────────────────────────────────────────────
-
-    def _capture(self, xv: tk.StringVar, yv: tk.StringVar):
-        """Minimise, wait for a mouse click, fill coords, restore."""
+    def _capture(self, xv, yv):
         self.iconify()
-
         def _run():
             time.sleep(0.5)
             captured = []
             try:
                 from pynput import mouse as pym
-
                 def on_click(x, y, button, pressed):
                     if pressed:
                         captured.append((int(x), int(y)))
-                        return False  # stop listener
-
+                        return False
                 with pym.Listener(on_click=on_click) as listener:
                     listener.join()
             except Exception:
                 pos = pyautogui.position()
                 captured.append((pos.x, pos.y))
-
             if captured:
                 xv.set(str(captured[0][0]))
                 yv.set(str(captured[0][1]))
-
             self.after(0, lambda: (self.deiconify(), self.focus()))
-
         threading.Thread(target=_run, daemon=True).start()
 
     def _cap_start(self): self._capture(self.xv,  self.yv)
     def _cap_end(self):   self._capture(self.x2v, self.y2v)
-
-    # ── save ────────────────────────────────────────────────────────────────────
 
     def _ok(self):
         try:
@@ -243,17 +387,23 @@ class NyaClicker(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(f"🐱  {APP_NAME}  v{VERSION}")
-        self.geometry("960x680")
+        self.geometry("980x700")
         self.minsize(820, 580)
 
-        self.actions: list[Action] = []
+        # Playback state
+        self.actions:   list[Action] = []
         self.running    = False
         self._thread    = None
         self._hotkey    = HOTKEY
 
+        # Recording state
+        self._recorder:  Recorder | None = None
+        self._recording  = False
+        self._rec_hotkey = HOTKEY_REC
+
         self._load_neko()
         self._build_ui()
-        self._register_hotkey()
+        self._register_hotkeys()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._tick()
 
@@ -277,7 +427,7 @@ class NyaClicker(ctk.CTk):
         sb = ctk.CTkFrame(self, width=188, corner_radius=0, fg_color="#14142b")
         sb.grid(row=0, column=0, sticky="nsew")
         sb.grid_propagate(False)
-        sb.grid_rowconfigure(8, weight=1)
+        sb.grid_rowconfigure(9, weight=1)
 
         if self._neko_sm:
             ctk.CTkLabel(sb, image=self._neko_sm, text="").grid(
@@ -301,8 +451,9 @@ class NyaClicker(ctk.CTk):
             return b
 
         nav(3, "⚡  Действия",   lambda: self._show("actions"))
-        nav(4, "⚙  Настройки",  lambda: self._show("settings"))
-        nav(5, "ℹ  О программе", lambda: self._show("about"))
+        nav(4, "🔴  Запись",     lambda: self._show("record"))
+        nav(5, "⚙  Настройки",  lambda: self._show("settings"))
+        nav(6, "ℹ  О программе", lambda: self._show("about"))
 
         self._start_btn = ctk.CTkButton(
             sb, text=f"▶  Старт  [{HOTKEY.upper()}]",
@@ -311,7 +462,7 @@ class NyaClicker(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._toggle
         )
-        self._start_btn.grid(row=9, column=0, padx=12, pady=(0, 22))
+        self._start_btn.grid(row=10, column=0, padx=12, pady=(0, 22))
 
         # ── main area ────────────────────────────────────────────────────────────
         self._main = ctk.CTkFrame(self, corner_radius=0, fg_color="#16213e")
@@ -321,6 +472,7 @@ class NyaClicker(ctk.CTk):
 
         self._tabs: dict[str, ctk.CTkBaseClass] = {}
         self._build_actions_tab()
+        self._build_record_tab()
         self._build_settings_tab()
         self._build_about_tab()
         self._show("actions")
@@ -332,7 +484,7 @@ class NyaClicker(ctk.CTk):
             font=ctk.CTkFont(size=11))
         self._status.grid(row=1, column=0, columnspan=2, sticky="ew")
 
-    # ── tabs ─────────────────────────────────────────────────────────────────────
+    # ── tab router ───────────────────────────────────────────────────────────────
 
     def _show(self, name: str):
         for t in self._tabs.values():
@@ -347,7 +499,6 @@ class NyaClicker(ctk.CTk):
         f.grid_rowconfigure(1, weight=1)
         self._tabs["actions"] = f
 
-        # toolbar
         tb = ctk.CTkFrame(f, fg_color="#1a1a2e", height=54)
         tb.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 5))
         tb.grid_columnconfigure(0, weight=1)
@@ -369,7 +520,6 @@ class NyaClicker(ctk.CTk):
                 fg_color=color, command=cmd
             ).pack(side="left", padx=3, pady=12)
 
-        # listbox
         lf = ctk.CTkFrame(f, fg_color="#111124")
         lf.grid(row=1, column=0, sticky="nsew", padx=14, pady=3)
         lf.grid_columnconfigure(0, weight=1)
@@ -387,7 +537,6 @@ class NyaClicker(ctk.CTk):
         self._lb.configure(yscrollcommand=sb2.set)
         self._lb.bind("<Double-Button-1>", lambda _: self._edit())
 
-        # bottom bar
         bb = ctk.CTkFrame(f, fg_color="#1a1a2e", height=46)
         bb.grid(row=2, column=0, sticky="ew", padx=14, pady=(3, 12))
         for label, cmd in [("⬆ Вверх", self._up), ("⬇ Вниз", self._down)]:
@@ -403,6 +552,114 @@ class NyaClicker(ctk.CTk):
             bb, text="💾 Сохранить", width=115, height=30,
             fg_color="#8e44ad", command=self._save
         ).pack(side="right", padx=5)
+
+    # ── record tab ───────────────────────────────────────────────────────────────
+
+    def _build_record_tab(self):
+        f = ctk.CTkFrame(self._main, fg_color="transparent")
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(2, weight=1)
+        self._tabs["record"] = f
+
+        # ── header ────────────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(f, fg_color="#1a1a2e", height=54)
+        hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 5))
+        hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            hdr, text="🔴  Запись и воспроизведение",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color="#FF6B9D"
+        ).grid(row=0, column=0, padx=14, sticky="w")
+
+        hint = ctk.CTkLabel(
+            hdr,
+            text=f"[{HOTKEY_REC.upper()}] — Старт/Стоп записи",
+            font=ctk.CTkFont(size=11), text_color="#666"
+        )
+        hint.grid(row=0, column=1, padx=12, sticky="e")
+
+        # ── status badge ─────────────────────────────────────────────────────────
+        badge_outer = ctk.CTkFrame(f, fg_color="#1a1a2e", corner_radius=10)
+        badge_outer.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
+        badge_outer.grid_columnconfigure(1, weight=1)
+
+        self._rec_dot = ctk.CTkLabel(
+            badge_outer, text="⚫", font=ctk.CTkFont(size=20)
+        )
+        self._rec_dot.grid(row=0, column=0, padx=(14, 6), pady=10)
+
+        self._rec_status_lbl = ctk.CTkLabel(
+            badge_outer,
+            text="Ожидание  —  нажмите кнопку ниже или F9 для начала записи",
+            font=ctk.CTkFont(size=13), text_color="#aaa", anchor="w"
+        )
+        self._rec_status_lbl.grid(row=0, column=1, padx=4, pady=10, sticky="w")
+
+        self._rec_count_lbl = ctk.CTkLabel(
+            badge_outer, text="0 событий",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#666"
+        )
+        self._rec_count_lbl.grid(row=0, column=2, padx=14, pady=10)
+
+        # ── recorded list ────────────────────────────────────────────────────────
+        lf = ctk.CTkFrame(f, fg_color="#111124")
+        lf.grid(row=2, column=0, sticky="nsew", padx=14, pady=3)
+        lf.grid_columnconfigure(0, weight=1)
+        lf.grid_rowconfigure(0, weight=1)
+
+        self._rec_lb = tk.Listbox(
+            lf, bg="#0d0d20", fg="#ddd",
+            selectbackground="#e94560", selectforeground="#fff",
+            borderwidth=0, highlightthickness=0,
+            font=("Consolas", 11), activestyle="none"
+        )
+        self._rec_lb.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        sb3 = ctk.CTkScrollbar(lf, command=self._rec_lb.yview)
+        sb3.grid(row=0, column=1, sticky="ns")
+        self._rec_lb.configure(yscrollcommand=sb3.set)
+
+        # ── bottom controls ──────────────────────────────────────────────────────
+        bb = ctk.CTkFrame(f, fg_color="#1a1a2e", height=54)
+        bb.grid(row=3, column=0, sticky="ew", padx=14, pady=(3, 12))
+
+        self._rec_toggle_btn = ctk.CTkButton(
+            bb, text=f"🔴  Начать запись  [{HOTKEY_REC.upper()}]",
+            width=200, height=36,
+            fg_color="#e94560", hover_color="#c0392b",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._toggle_rec
+        )
+        self._rec_toggle_btn.pack(side="left", padx=8, pady=9)
+
+        ctk.CTkButton(
+            bb, text="🗑 Очистить", width=100, height=36,
+            fg_color="#555", hover_color="#444",
+            command=self._rec_clear
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            bb, text="▶ Воспроизвести", width=140, height=36,
+            fg_color="#2ecc71", hover_color="#27ae60",
+            command=self._rec_play
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            bb, text="📂 Загрузить", width=110, height=36,
+            fg_color="#2980b9",
+            command=self._rec_load
+        ).pack(side="right", padx=8)
+
+        ctk.CTkButton(
+            bb, text="💾 Сохранить", width=110, height=36,
+            fg_color="#8e44ad",
+            command=self._rec_save
+        ).pack(side="right", padx=4)
+
+        ctk.CTkButton(
+            bb, text="➕ В список действий", width=155, height=36,
+            fg_color="#16a085", hover_color="#1abc9c",
+            command=self._rec_add_to_actions
+        ).pack(side="right", padx=4)
 
     # ── settings tab ─────────────────────────────────────────────────────────────
 
@@ -434,7 +691,6 @@ class NyaClicker(ctk.CTk):
             ctk.CTkEntry(parent, textvariable=var, width=110).grid(
                 row=r, column=1, padx=14, pady=7, sticky="w")
 
-        # ── Global ────────────────────────────────────────────────────────────────
         g = card(1, "Глобальные")
         self._sv_loops    = tk.StringVar(value="0")
         self._sv_gdelay   = tk.StringVar(value="0")
@@ -448,7 +704,6 @@ class NyaClicker(ctk.CTk):
             variable=self._sv_stop_err
         ).grid(row=4, column=0, columnspan=2, padx=14, pady=(4, 12), sticky="w")
 
-        # ── Mouse ─────────────────────────────────────────────────────────────────
         m = card(2, "Мышь")
         self._sv_move_dur = tk.StringVar(value="0")
         row(m, 1, "Длительность движения курсора (сек, 0 = мгновенно):", self._sv_move_dur)
@@ -458,16 +713,17 @@ class NyaClicker(ctk.CTk):
             variable=self._sv_smooth
         ).grid(row=2, column=0, columnspan=2, padx=14, pady=(4, 12), sticky="w")
 
-        # ── Hotkey ────────────────────────────────────────────────────────────────
-        h = card(3, "Горячая клавиша  Старт / Стоп")
-        self._sv_hotkey = tk.StringVar(value=HOTKEY.upper())
-        ctk.CTkLabel(h, text="Клавиша:").grid(row=1, column=0, padx=14, pady=7, sticky="w")
-        ctk.CTkEntry(h, textvariable=self._sv_hotkey, width=110).grid(
-            row=1, column=1, padx=14, sticky="w")
-        ctk.CTkButton(
-            h, text="Применить", width=100, height=28,
-            fg_color="#8e44ad", command=self._apply_hotkey
-        ).grid(row=1, column=2, padx=8, pady=(4, 12))
+        h = card(3, "Горячие клавиши")
+        self._sv_hotkey     = tk.StringVar(value=HOTKEY.upper())
+        self._sv_rec_hotkey = tk.StringVar(value=HOTKEY_REC.upper())
+        ctk.CTkLabel(h, text="Старт / Стоп воспроизведения:").grid(row=1, column=0, padx=14, pady=7, sticky="w")
+        ctk.CTkEntry(h, textvariable=self._sv_hotkey, width=90).grid(row=1, column=1, padx=14, sticky="w")
+        ctk.CTkButton(h, text="Применить", width=90, height=28, fg_color="#8e44ad",
+                      command=self._apply_hotkey).grid(row=1, column=2, padx=8, pady=(4, 4))
+        ctk.CTkLabel(h, text="Старт / Стоп записи:").grid(row=2, column=0, padx=14, pady=7, sticky="w")
+        ctk.CTkEntry(h, textvariable=self._sv_rec_hotkey, width=90).grid(row=2, column=1, padx=14, sticky="w")
+        ctk.CTkButton(h, text="Применить", width=90, height=28, fg_color="#8e44ad",
+                      command=self._apply_rec_hotkey).grid(row=2, column=2, padx=8, pady=(0, 12))
 
         ctk.CTkButton(
             f, text="💾  Применить настройки", width=210,
@@ -512,8 +768,9 @@ class NyaClicker(ctk.CTk):
         ).pack(pady=(10, 2))
         ctk.CTkLabel(
             info,
-            text=f"[{HOTKEY.upper()}]  —  Старт / Стоп\n"
-                 "[📍 Захват]  —  Кликните по экрану в диалоге\n"
+            text=f"[F8]  —  Старт / Стоп воспроизведения\n"
+                 f"[F9]  —  Старт / Стоп записи\n"
+                 "[📍 Захват]  —  Кликни по экрану в диалоге\n"
                  "Угол (0, 0)  —  Аварийная остановка (FailSafe)",
             text_color="#ccc", justify="center"
         ).pack(pady=(0, 10))
@@ -523,7 +780,7 @@ class NyaClicker(ctk.CTk):
             text_color="#444", font=ctk.CTkFont(size=10)
         ).pack(pady=8)
 
-    # ── list helpers ─────────────────────────────────────────────────────────────
+    # ── actions list helpers ──────────────────────────────────────────────────────
 
     def _refresh(self):
         self._lb.delete(0, tk.END)
@@ -603,14 +860,196 @@ class NyaClicker(ctk.CTk):
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
 
-    # ── hotkey ───────────────────────────────────────────────────────────────────
+    # ── recording logic ───────────────────────────────────────────────────────────
 
-    def _register_hotkey(self):
+    def _toggle_rec(self):
+        if self._recording:
+            self._stop_rec()
+        else:
+            self._start_rec()
+
+    def _start_rec(self):
+        if self.running:
+            messagebox.showwarning("", "Остановите воспроизведение перед записью")
+            return
+        self._recording = True
+        self._recorder  = Recorder(
+            on_action  = self._rec_action_cb,
+            on_stopped = self._rec_stopped_cb
+        )
+        self._recorder.start()
+        self._rec_toggle_btn.configure(
+            text=f"⏹  Остановить запись  [{self._rec_hotkey.upper()}]",
+            fg_color="#c0392b", hover_color="#a93226"
+        )
+        self._rec_dot.configure(text="🔴")
+        self._rec_status_lbl.configure(
+            text="ЗАПИСЬ ИДЁТ...  кликайте, свайпайте — всё записывается",
+            text_color="#e74c3c"
+        )
+        self._status.configure(
+            text=f"🔴  ЗАПИСЬ  |  [{self._rec_hotkey.upper()}] — стоп",
+            text_color="#e74c3c"
+        )
+
+    def _stop_rec(self):
+        if self._recorder:
+            self._recorder.stop()  # calls _rec_stopped_cb via thread
+
+    def _rec_action_cb(self, action: Action):
+        """Called from background thread for each captured event."""
+        def _update():
+            if not self._recording:
+                return
+            n = len(self._recorder.recorded) if self._recorder else 0
+            self._rec_lb.insert(tk.END, action.rec_label(n))
+            self._rec_lb.see(tk.END)
+            self._rec_count_lbl.configure(text=f"{n} событий")
+        self.after(0, _update)
+
+    def _rec_stopped_cb(self):
+        """Called from background thread when recording is fully stopped."""
+        def _update():
+            self._recording = False
+            n = len(self._recorder.recorded) if self._recorder else 0
+            self._rec_toggle_btn.configure(
+                text=f"🔴  Начать запись  [{self._rec_hotkey.upper()}]",
+                fg_color="#e94560", hover_color="#c0392b"
+            )
+            self._rec_dot.configure(text="⚫")
+            self._rec_status_lbl.configure(
+                text=f"Запись остановлена  —  {n} событий захвачено",
+                text_color="#aaa"
+            )
+            self._status.configure(
+                text=f"⚫  Запись остановлена  |  {n} событий",
+                text_color="#666"
+            )
+        self.after(0, _update)
+
+    def _rec_clear(self):
+        if self._recording:
+            messagebox.showwarning("", "Остановите запись перед очисткой")
+            return
+        self._rec_lb.delete(0, tk.END)
+        if self._recorder:
+            self._recorder.recorded.clear()
+        self._rec_count_lbl.configure(text="0 событий")
+        self._rec_status_lbl.configure(
+            text="Очищено  —  нажмите кнопку для новой записи",
+            text_color="#aaa"
+        )
+
+    def _rec_play(self):
+        """Play back the recorded actions immediately."""
+        if not self._recorder or not self._recorder.recorded:
+            messagebox.showwarning("Пусто", "Нет записанных действий для воспроизведения")
+            return
+        if self._recording:
+            messagebox.showwarning("", "Остановите запись")
+            return
+        if self.running:
+            messagebox.showwarning("", "Воспроизведение уже идёт")
+            return
+
+        # Temporarily load recorded actions, play, restore afterwards
+        saved = self.actions[:]
+        self.actions = [Action.from_dict(a.to_dict()) for a in self._recorder.recorded]
+        self.running = True
+        self._start_btn.configure(
+            text=f"⏹  Стоп  [{self._hotkey.upper()}]",
+            fg_color="#e74c3c", hover_color="#c0392b"
+        )
+
+        def _done():
+            self.actions = saved
+            self._refresh()
+
+        self._thread = threading.Thread(
+            target=self._run_loop_once, args=(_done,), daemon=True
+        )
+        self._thread.start()
+
+    def _run_loop_once(self, on_done):
+        """Play recorded actions exactly once, then call on_done."""
         try:
-            keyboard.remove_hotkey(self._hotkey)
+            move_dur = float(self._sv_move_dur.get())
+            stop_err = self._sv_stop_err.get()
+        except Exception:
+            move_dur, stop_err = 0.0, True
+
+        for action in self.actions:
+            if not self.running:
+                break
+            if not action.enabled:
+                continue
+            self._execute(action, move_dur, stop_err)
+
+        self.after(0, self._stop)
+        self.after(0, on_done)
+
+    def _rec_add_to_actions(self):
+        if not self._recorder or not self._recorder.recorded:
+            messagebox.showwarning("Пусто", "Нет записанных действий")
+            return
+        added = len(self._recorder.recorded)
+        for a in self._recorder.recorded:
+            self.actions.append(Action.from_dict(a.to_dict()))
+        self._refresh()
+        self._show("actions")
+        self._status.configure(text=f"● Добавлено {added} действий из записи")
+
+    def _rec_save(self):
+        if not self._recorder or not self._recorder.recorded:
+            messagebox.showwarning("Пусто", "Нет записанных действий для сохранения")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+            title="Сохранить запись"
+        )
+        if p:
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump([a.to_dict() for a in self._recorder.recorded], fh,
+                          ensure_ascii=False, indent=2)
+            self._status.configure(text=f"● Запись сохранена: {os.path.basename(p)}")
+
+    def _rec_load(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("Все файлы", "*.*")],
+            title="Загрузить запись"
+        )
+        if p:
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if self._recorder is None:
+                    self._recorder = Recorder(
+                        on_action=self._rec_action_cb,
+                        on_stopped=self._rec_stopped_cb
+                    )
+                self._recorder.recorded = [Action.from_dict(d) for d in data]
+                self._rec_lb.delete(0, tk.END)
+                for i, a in enumerate(self._recorder.recorded, 1):
+                    self._rec_lb.insert(tk.END, a.rec_label(i))
+                n = len(self._recorder.recorded)
+                self._rec_count_lbl.configure(text=f"{n} событий")
+                self._rec_status_lbl.configure(
+                    text=f"Загружено {n} событий из файла",
+                    text_color="#aaa"
+                )
+                self._status.configure(text=f"● Загружено: {os.path.basename(p)}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+    # ── hotkeys ──────────────────────────────────────────────────────────────────
+
+    def _register_hotkeys(self):
+        try:
+            keyboard.add_hotkey(self._hotkey,     self._toggle)
+            keyboard.add_hotkey(self._rec_hotkey, self._toggle_rec)
         except Exception:
             pass
-        keyboard.add_hotkey(self._hotkey, self._toggle)
 
     def _apply_hotkey(self):
         new = self._sv_hotkey.get().strip().lower()
@@ -623,9 +1062,24 @@ class NyaClicker(ctk.CTk):
         self._hotkey = new
         keyboard.add_hotkey(self._hotkey, self._toggle)
         self._start_btn.configure(text=f"▶  Старт  [{new.upper()}]")
-        self._status.configure(text=f"● Горячая клавиша изменена: {new.upper()}")
+        self._status.configure(text=f"● Горячая клавиша воспр.: {new.upper()}")
 
-    # ── runner ───────────────────────────────────────────────────────────────────
+    def _apply_rec_hotkey(self):
+        new = self._sv_rec_hotkey.get().strip().lower()
+        if not new:
+            return
+        try:
+            keyboard.remove_hotkey(self._rec_hotkey)
+        except Exception:
+            pass
+        self._rec_hotkey = new
+        keyboard.add_hotkey(self._rec_hotkey, self._toggle_rec)
+        self._rec_toggle_btn.configure(
+            text=f"🔴  Начать запись  [{new.upper()}]"
+        )
+        self._status.configure(text=f"● Горячая клавиша записи: {new.upper()}")
+
+    # ── runner (playback) ─────────────────────────────────────────────────────────
 
     def _toggle(self):
         if self.running:
@@ -717,21 +1171,30 @@ class NyaClicker(ctk.CTk):
     # ── status ticker ────────────────────────────────────────────────────────────
 
     def _tick(self):
-        n = len(self.actions)
-        if self.running:
+        if self._recording:
+            pass  # status is managed by rec callbacks
+        elif self.running:
+            n = len(self.actions)
             self._status.configure(
-                text=f"🔴  РАБОТАЕТ  |  действий: {n}  |  [{self._hotkey.upper()}] — стоп",
+                text=f"🔴  ВОСПРОИЗВОДИТСЯ  |  действий: {n}  |  [{self._hotkey.upper()}] — стоп",
                 text_color="#e74c3c"
             )
         else:
+            n = len(self.actions)
             self._status.configure(
-                text=f"⚫  Готов  |  действий: {n}  |  [{self._hotkey.upper()}] — старт",
+                text=f"⚫  Готов  |  действий: {n}  |  F8 — старт  |  F9 — запись",
                 text_color="#666"
             )
         self.after(400, self._tick)
 
     def _close(self):
-        self.running = False
+        self.running    = False
+        self._recording = False
+        if self._recorder:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
         try:
             keyboard.unhook_all()
         except Exception:
